@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# โหลด ENV จาก .env (ถ้ามี)
+# โหลด ENV จาก .env ถ้ามี
 if [ -f .env ]; then
-  . ./.env
+  export $(grep -v '^#' .env | xargs)
 fi
 
-# ตรวจสอบว่า API KEY ถูกตั้งหรือยัง
+# ตรวจสอบว่า API KEY ถูกตั้งไว้หรือไม่
 if [ -z "$GEMINI_API_KEY" ]; then
   echo "❌ ERROR: GEMINI_API_KEY is not set. Please add it to your .env file or export it."
   exit 1
@@ -14,36 +14,44 @@ fi
 # อ่าน diff ที่ถูก staged
 DIFF=$(git diff --cached --no-color --no-ext-diff)
 
-# ตรวจสอบว่ามี diff หรือไม่
+# ถ้าไม่มี diff ให้ถามผู้ใช้ว่าจะ add หรือไม่
 if [ -z "$DIFF" ]; then
-  echo "✅ No changes staged for commit. Nothing to do."
-  exit 0
+  echo "✅ No changes staged for commit."
+  read -p "Do you want to add all changes? [Y/n]: " CONFIRM
+  CONFIRM=${CONFIRM:-Y}
+  if [[ $CONFIRM =~ ^[Yy]$ ]]; then
+    git add .
+    echo "✅ Files added."
+    DIFF=$(git diff --cached --no-color --no-ext-diff)
+    if [ -z "$DIFF" ]; then
+      echo "❌ Nothing to commit even after adding."
+      exit 0
+    fi
+  else
+    echo "❌ Add cancelled."
+    exit 0
+  fi
 fi
 
-# ----- สร้าง JSON Payload โดยไม่ต้องใช้ jq -----
-# 1. Escape backslashes (\) -> \\
-# 2. Escape double quotes (") -> \"
-# 3. แปลง newlines (การขึ้นบรรทัดใหม่) ให้กลายเป็นตัวอักษร \n
-ESCAPED_DIFF=$(echo "$DIFF" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}')
+# Escape DIFF ให้เหมาะสำหรับ JSON (ไม่ใช้ jq)
+ESCAPED_DIFF=$(printf '%s\n' "$DIFF" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/' | tr -d '\n')
 
-# 2. สร้าง JSON Payload เป็น string
-JSON_PAYLOAD=$(cat <<EOF
+# สร้าง JSON Payload
+read -r -d '' JSON_PAYLOAD <<EOF
 {
   "contents": [
     {
       "parts": [
         {
-          "text": "Write a concise and clear Git commit message in Conventional Commits format for this diff:\n\n\`\`\`diff\n$ESCAPED_DIFF\n\`\`\`"
+          "text": "Write a concise and clear Git commit message in Conventional Commits format for this diff:\\n\\n\`\`\`diff\\n$ESCAPED_DIFF\\n\`\`\`"
         }
       ]
     }
   ]
 }
 EOF
-)
 
-# ส่งคำขอไปยัง Gemini API
-# เพิ่ม -k (--insecure) เพื่อแก้ปัญหา certificate บน Windows (CRYPT_E_NO_REVOCATION_CHECK)
+# เรียก Gemini API
 RESPONSE=$(curl -sfSk -X POST \
   -H "Content-Type: application/json" \
   -d "$JSON_PAYLOAD" \
@@ -52,39 +60,44 @@ RESPONSE=$(curl -sfSk -X POST \
 # ตรวจสอบว่า curl ทำงานสำเร็จหรือไม่
 if [ $? -ne 0 ]; then
   echo -e "\n❌ ERROR: Failed to get a response from Gemini API."
-  echo "Please check your API key, internet connection, and network/firewall settings."
   exit 1
 fi
 
-
-# ----- ดึงข้อความออกจาก JSON Response โดยไม่ต้องใช้ jq -----
+# แยกข้อความ commit message ออกโดยไม่ใช้ jq
 MESSAGE=$(echo "$RESPONSE" | grep -oP '"text":\s*"\K(.*?)(?=")' | head -n 1)
+MESSAGE=$(echo -e "$MESSAGE" | sed '/^```/d')
 
-# แปลง escape sequence เช่น \n ให้เป็นบรรทัดใหม่จริง ๆ
-MESSAGE=$(echo -e "$MESSAGE")
-
-# ลบ backticks และ code fences (```diff, ``` ฯลฯ)
-MESSAGE=$(echo "$MESSAGE" | sed '/^```/d')
-
+# ตรวจสอบว่าได้ข้อความกลับมาหรือไม่
 if [ -z "$MESSAGE" ]; then
-    echo -e "\n❌ ERROR: Could not parse the commit message from the API response."
-    echo -e "\n📦 RAW RESPONSE:"
-    echo "$RESPONSE"
-    exit 1
+  echo -e "\n❌ ERROR: Could not parse commit message from API response."
+  echo -e "\n📦 RAW RESPONSE:"
+  echo "$RESPONSE"
+  exit 1
 fi
 
-# แสดง commit message ที่ได้
-echo -e "\n📥 Suggested commit message:\n--------------------------"
-echo -e "$MESSAGE"
-echo "--------------------------"
+# แสดงข้อความ commit ที่แนะนำ
+echo -e "\n📥 Suggested commit message:"
+echo "----------------------------------------"
+echo "$MESSAGE"
+echo "----------------------------------------"
 
-# ถามผู้ใช้ก่อน commit
+# ยืนยันการ commit
 read -p "Do you want to commit with this message? [Y/n]: " CONFIRM
 CONFIRM=${CONFIRM:-Y}
-
 if [[ $CONFIRM =~ ^[Yy]$ ]]; then
   git commit -m "$MESSAGE"
   echo "✅ Commit successful."
 else
   echo "❌ Commit cancelled."
+  exit 0
+fi
+
+# ยืนยันการ push
+read -p "Do you want to push to remote? [Y/n]: " CONFIRM
+CONFIRM=${CONFIRM:-Y}
+if [[ $CONFIRM =~ ^[Yy]$ ]]; then
+  git push
+  echo "✅ Push successful."
+else
+  echo "❌ Push cancelled."
 fi
